@@ -1,0 +1,33 @@
+# Local artefacts
+.bridge/
+.ci-smoke/
+
+# Build output — `bin/bridge-gate` is produced by `make build`, never committed
+bin/
+
+# SBCL fasl caches
+*.fasl
+*.dfsl
+*.fsl
+*.dx64fsl
+*.lx64fsl
+*.lx32fsl
+*.sparcf
+
+# Editor / OS noise
+*~
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# Secrets and local config (config.edn may hold credentials)
+/config.edn
+.env
+.env.*
+*.pem
+*.key
+credentials.json

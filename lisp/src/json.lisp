@@ -1,0 +1,350 @@
+;;;; json.lisp --- Self-contained JSON parser and deterministic emitter.
+;;;;
+;;;; Zero-dependency pure Common Lisp: a recursive-descent parser plus a
+;;;; sorted-key emitter. Uses only COMMON-LISP + UIOP (for parse-file), so
+;;;; `sbcl --script build.lisp` works standalone with no Quicklisp.
+;;;;
+;;;; Value model (matches bridge-gate conventions):
+;;;;   object -> hash-table (test 'equal), array -> vector,
+;;;;   true -> T, false -> :FALSE, null -> NIL.
+;;;;   Empty array decodes to #() (never NIL) so [] and null stay distinct.
+
+(defpackage #:bridge-gate.json
+  (:use #:cl)
+  (:export #:json-error
+           #:json-error-message
+           #:parse
+           #:parse-file
+           #:stringify
+           #:write-compact
+           #:write-pretty))
+
+(in-package #:bridge-gate.json)
+
+(define-condition json-error (error)
+  ((message :initarg :message :reader json-error-message))
+  (:report (lambda (condition stream)
+               (format stream "~a" (json-error-message condition)))))
+
+(defun json-fail (control &rest arguments)
+  (error 'json-error :message (apply #'format nil control arguments)))
+(declaim (ftype function read-value read-object read-array))
+
+(defstruct (reader (:constructor make-reader (string)))
+  (string "" :type string)
+  (position 0 :type fixnum))
+
+(defun reader-end-p (reader)
+  (>= (reader-position reader) (length (reader-string reader))))
+
+(defun peek-char-at (reader)
+  (unless (reader-end-p reader)
+    (char (reader-string reader) (reader-position reader))))
+
+(defun next-char (reader)
+  (prog1 (peek-char-at reader)
+    (incf (reader-position reader))))
+
+(defun json-whitespace-p (character)
+  (and character
+       (member character '(#\Space #\Tab #\Newline #\Return) :test #'char=)))
+
+(defun skip-whitespace (reader)
+  (loop while (json-whitespace-p (peek-char-at reader))
+        do (incf (reader-position reader))))
+
+(defun expect-char (reader expected)
+  (let ((character (next-char reader)))
+    (unless (and character (char= character expected))
+      (json-fail "Expected ~s" expected))))
+
+(defun match-literal (reader literal)
+  (loop for character across literal
+        do (let ((got (next-char reader)))
+             (unless (and got (char= got character))
+               (json-fail "Invalid literal near ~s" literal)))))
+
+(defun hex-value (character)
+  (cond ((and (char>= character #\0) (char<= character #\9))
+         (- (char-code character) (char-code #\0)))
+        ((and (char>= character #\a) (char<= character #\f))
+         (+ 10 (- (char-code character) (char-code #\a))))
+        ((and (char>= character #\A) (char<= character #\F))
+         (+ 10 (- (char-code character) (char-code #\A))))
+        (t (json-fail "Invalid hex digit ~s" character))))
+
+(defun read-unicode-escape (reader)
+  (let ((code 0))
+    (dotimes (index 4)
+      (when (reader-end-p reader)
+        (json-fail "Unterminated unicode escape"))
+      (setf code (+ (* code 16) (hex-value (next-char reader)))))
+    code))
+
+(defun read-string-literal (reader)
+  (expect-char reader #\")
+  (with-output-to-string (out)
+    (loop
+      (when (reader-end-p reader)
+        (json-fail "Unterminated string literal"))
+      (let ((character (next-char reader)))
+        (cond ((char= character #\")
+               (return))
+              ((char= character #\\)
+               (when (reader-end-p reader)
+                 (json-fail "Unterminated string escape"))
+               (let ((escape (next-char reader)))
+                 (case escape
+                   (#\" (write-char #\" out))
+                   (#\\ (write-char #\\ out))
+                   (#\/ (write-char #\/ out))
+                   (#\b (write-char #\Backspace out))
+                   (#\f (write-char #\Page out))
+                   (#\n (write-char #\Newline out))
+                   (#\r (write-char #\Return out))
+                   (#\t (write-char #\Tab out))
+                   (#\u
+                    (let ((code (read-unicode-escape reader)))
+                      (cond ((and (>= code #xD800) (<= code #xDBFF))
+                             (expect-char reader #\\)
+                             (expect-char reader #\u)
+                             (let ((low (read-unicode-escape reader)))
+                               (unless (and (>= low #xDC00) (<= low #xDFFF))
+                                 (json-fail "Invalid low surrogate ~x" low))
+                               (write-char (code-char (+ #x10000
+                                                         (* (- code #xD800) #x400)
+                                                         (- low #xDC00)))
+                                           out)))
+                            ((and (>= code #xDC00) (<= code #xDFFF))
+                             (json-fail "Lone low surrogate"))
+                            (t (write-char (code-char code) out)))))
+                   (t (json-fail "Unsupported string escape \\~a" escape)))))
+              ((< (char-code character) #x20)
+               (json-fail "Unescaped control character"))
+              (t (write-char character out)))))))
+
+(defun number-char-p (character)
+  (and character
+       (or (digit-char-p character)
+           (member character '(#\+ #\- #\. #\e #\E) :test #'char=))))
+
+(defun read-number-literal (reader)
+  (let ((start (reader-position reader)))
+    (loop while (number-char-p (peek-char-at reader))
+          do (incf (reader-position reader)))
+    (let ((token (subseq (reader-string reader) start (reader-position reader))))
+      (when (zerop (length token))
+        (json-fail "Expected a value"))
+      (cond ((or (find #\. token) (find #\e token) (find #\E token))
+             (let ((*read-default-float-format* 'double-float))
+               (multiple-value-bind (value position)
+                   (read-from-string token nil nil)
+                 (unless (and (realp value) (= position (length token)))
+                   (json-fail "Invalid number ~s" token))
+                 (coerce value 'double-float))))
+            (t
+             (multiple-value-bind (value position)
+                 (ignore-errors (parse-integer token))
+               (unless (and value (= position (length token)))
+                 (json-fail "Invalid number ~s" token))
+               value))))))
+
+(defun keywordize-key (key keywordize)
+  (if (and keywordize (stringp key))
+      (intern (string-upcase key) :keyword)
+      key))
+
+(defun read-value (reader keywordize)
+  (skip-whitespace reader)
+  (when (reader-end-p reader)
+    (json-fail "Unexpected end of input"))
+  (let ((character (peek-char-at reader)))
+    (cond ((char= character #\{) (read-object reader keywordize))
+          ((char= character #\[) (read-array reader keywordize))
+          ((char= character #\") (read-string-literal reader))
+          ((or (digit-char-p character) (char= character #\-))
+           (read-number-literal reader))
+          ((char= character #\t) (match-literal reader "true") t)
+          ((char= character #\f) (match-literal reader "false") :false)
+          ((char= character #\n) (match-literal reader "null") nil)
+          (t (json-fail "Unexpected character ~s" character)))))
+
+(defun read-object (reader keywordize)
+  (expect-char reader #\{)
+  (let ((map (make-hash-table :test 'equal)))
+    (skip-whitespace reader)
+    (when (char= (or (peek-char-at reader) #\X) #\})
+      (next-char reader)
+      (return-from read-object map))
+    (loop
+      (skip-whitespace reader)
+      (unless (char= (or (peek-char-at reader) #\X) #\")
+        (json-fail "Object keys must be strings"))
+      (let ((key (keywordize-key (read-string-literal reader) keywordize)))
+        (skip-whitespace reader)
+        (expect-char reader #\:)
+        (setf (gethash key map) (read-value reader keywordize)))
+      (skip-whitespace reader)
+      (let ((character (next-char reader)))
+        (cond ((null character) (json-fail "Unterminated object"))
+              ((char= character #\}) (return map))
+              ((char= character #\,) nil)
+              (t (json-fail "Expected , or } in object")))))
+    map))
+
+(defun read-array (reader keywordize)
+  (expect-char reader #\[)
+  (let ((items '()))
+    (skip-whitespace reader)
+    (when (char= (or (peek-char-at reader) #\X) #\])
+      (next-char reader)
+      (return-from read-array (vector)))
+    (loop
+      (push (read-value reader keywordize) items)
+      (skip-whitespace reader)
+      (let ((character (next-char reader)))
+        (cond ((null character) (json-fail "Unterminated array"))
+              ((char= character #\]) (return (coerce (nreverse items) 'vector)))
+              ((char= character #\,) nil)
+              (t (json-fail "Expected , or ] in array")))))))
+
+(defun parse (string &key keywordize)
+  "Parse STRING as JSON. With KEYWORDIZE, object keys become keywords.
+False becomes :FALSE, null becomes NIL, empty arrays stay #()."
+  (let ((reader (make-reader string)))
+    (skip-whitespace reader)
+    (when (reader-end-p reader)
+      (json-fail "Empty JSON document"))
+    (let ((value (read-value reader keywordize)))
+      (skip-whitespace reader)
+      (unless (reader-end-p reader)
+        (json-fail "Trailing content after JSON value"))
+      value)))
+
+(defun parse-file (path &key keywordize)
+  (parse (uiop:read-file-string path :external-format :utf-8)
+         :keywordize keywordize))
+
+(defun json-key (key)
+  (etypecase key
+    (string key)
+    (keyword (string-downcase (symbol-name key)))
+    (symbol (string-downcase (symbol-name key)))))
+
+(defun sorted-keys (map)
+  (let ((keys '()))
+    (maphash (lambda (key value)
+               (declare (ignore value))
+               (push key keys))
+             map)
+    (sort keys #'string< :key #'json-key)))
+
+(defun write-json-string (string stream)
+  (write-char #\" stream)
+  (loop for character across string
+        for code = (char-code character)
+        do (cond ((char= character #\") (write-string "\\\"" stream))
+                 ((char= character #\\) (write-string "\\\\" stream))
+                 ((char= character #\Newline) (write-string "\\n" stream))
+                 ((char= character #\Tab) (write-string "\\t" stream))
+                 ((char= character #\Return) (write-string "\\r" stream))
+                 ((char= character #\Page) (write-string "\\f" stream))
+                 ((char= character #\Backspace) (write-string "\\b" stream))
+                 ((< code #x20) (format stream "\\u~4,'0x" code))
+                 (t (write-char character stream))))
+  (write-char #\" stream))
+
+(defun write-scalar (value stream)
+  (cond ((null value) (write-string "null" stream))
+        ((eq value t) (write-string "true" stream))
+        ((eq value :false) (write-string "false" stream))
+        ((stringp value) (write-json-string value stream))
+        ((keywordp value)
+         (write-json-string (string-downcase (symbol-name value)) stream))
+        ((integerp value) (format stream "~d" value))
+        ((rationalp value) (format stream "~a" value))
+        ((floatp value) (format stream "~g" value))
+        ((symbolp value)
+         (write-json-string (string-downcase (symbol-name value)) stream))
+        (t (write-json-string (princ-to-string value) stream))))
+
+(defun scalar-json-p (value)
+  (or (null value) (eq value t) (eq value :false)
+      (stringp value) (keywordp value) (numberp value) (symbolp value)))
+
+(defun sequence-items (value)
+  (coerce value 'vector))
+
+(defun write-indent (stream count)
+  (loop repeat count do (write-char #\Space stream)))
+
+(defun write-pretty-value (value stream indent)
+  (cond ((hash-table-p value)
+         (if (zerop (hash-table-count value))
+             (write-string "{}" stream)
+             (progn
+               (write-string "{" stream)
+               (let ((first t))
+                 (dolist (key (sorted-keys value))
+                   (if first (setf first nil) (write-string "," stream))
+                   (terpri stream)
+                   (write-indent stream (+ indent 2))
+                   (write-json-string (json-key key) stream)
+                   (write-string ": " stream)
+                   (write-pretty-value (gethash key value) stream (+ indent 2))))
+               (terpri stream)
+               (write-indent stream indent)
+               (write-string "}" stream))))
+        ((and (not (stringp value))
+              (or (vectorp value) (consp value)))
+         (let ((items (sequence-items value)))
+           (cond ((zerop (length items)) (write-string "[]" stream))
+                 ((every #'scalar-json-p items)
+                  (write-string "[" stream)
+                  (loop for index from 0 below (length items)
+                        do (when (plusp index) (write-string ", " stream))
+                           (write-pretty-value (aref items index) stream indent))
+                  (write-string "]" stream))
+                 (t
+                  (write-string "[" stream)
+                  (loop for index from 0 below (length items)
+                        do (when (plusp index) (write-string "," stream))
+                           (terpri stream)
+                           (write-indent stream (+ indent 2))
+                           (write-pretty-value (aref items index) stream (+ indent 2)))
+                  (terpri stream)
+                  (write-indent stream indent)
+                  (write-string "]" stream)))))
+        (t (write-scalar value stream))))
+
+(defun write-compact-value (value stream)
+  (cond ((hash-table-p value)
+         (write-char #\{ stream)
+         (let ((first t))
+           (dolist (key (sorted-keys value))
+             (if first (setf first nil) (write-char #\, stream))
+             (write-json-string (json-key key) stream)
+             (write-char #\: stream)
+             (write-compact-value (gethash key value) stream)))
+         (write-char #\} stream))
+        ((and (not (stringp value))
+              (or (vectorp value) (consp value)))
+         (write-char #\[ stream)
+         (let ((items (sequence-items value)))
+           (loop for index from 0 below (length items)
+                 do (when (plusp index) (write-char #\, stream))
+                    (write-compact-value (aref items index) stream)))
+         (write-char #\] stream))
+        (t (write-scalar value stream))))
+
+(defun write-pretty (value stream)
+  (write-pretty-value value stream 0))
+
+(defun write-compact (value stream)
+  (write-compact-value value stream))
+
+(defun stringify (value &key pretty)
+  (with-output-to-string (stream)
+    (if pretty
+        (write-pretty value stream)
+        (write-compact value stream))))

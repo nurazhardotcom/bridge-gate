@@ -1,0 +1,87 @@
+# CI for bridge-gate. The repository has one runtime: SBCL.
+#
+# Zero external dependencies: no Quicklisp install, and no other language
+# toolchain anywhere. Tests and the smoke run are offline (mock HTTP
+# clients), so no CyberArk or Tenable credentials are needed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sbcl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install SBCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sbcl libzstd-dev
+
+      # `make build` saves a compressed core, which requires an SBCL runtime
+      # built with --with-sb-core-compression. Distro packages may omit it, so
+      # fall back to a source build of the pinned release.
+      - name: Ensure SBCL with core compression
+        run: |
+          if sbcl --non-interactive \
+               --eval '(unless (member :sb-core-compression *features*) (uiop:quit 1))'; then
+            echo "system SBCL supports core compression"
+            exit 0
+          fi
+          sudo apt-get install -y build-essential zlib1g-dev
+          curl -sL -o sbcl.tar.gz \
+            https://github.com/sbcl/sbcl/archive/refs/tags/sbcl-2.6.6.tar.gz
+          tar xzf sbcl.tar.gz
+          cd sbcl-sbcl-2.6.6
+          sh make.sh --xc-host='sbcl --no-userinit --disable-debugger' \
+            --with-sb-core-compression --prefix="$HOME/.local/sbcl"
+          sh install.sh
+          echo "$HOME/.local/sbcl/bin" >> "$GITHUB_PATH"
+
+      - name: Assert zero external Lisp dependencies
+        run: make deps
+
+      - name: Run test suite (forced compile, warnings as errors)
+        run: make test
+
+      - name: Build standalone binary
+        run: make build
+
+      - name: Binary smoke test (exit codes 0/1/2)
+        run: ./scripts/verify.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # .edn is allowed: policies/*.edn and config.edn.example are data read by
+      # the in-tree EDN reader, not code. Only Common Lisp under lisp/ is code.
+      - name: Check for legacy runtime files
+        run: |
+          set -euo pipefail
+          bad=$(find . -path ./.git -prune -o -type f \
+                  \( -name '*.clj' -o -name '*.cljc' -o -name '*.cljs' \
+                     -o -name '*.bb' -o -name 'b[b].edn' -o -name 'dep[s].edn' \
+                     -o -name 'package.json' -o -name '*.lisp' \) -print \
+                | grep -v -E '^\./lisp/(src|test)/' | grep -v -E '^\./lisp/build\.lisp$' || true)
+          if [ -n "$bad" ]; then
+            printf 'legacy or misplaced files:\n%s\n' "$bad" >&2
+            exit 1
+          fi
+
+      - name: Check repository layout
+        run: |
+          set -euo pipefail
+          for path in lisp/bridge-gate.asd lisp/build.lisp lisp/src lisp/test \
+                      scripts/test.sh scripts/verify.sh VERSION ARCHITECTURE.md; do
+            [ -e "$path" ] || { echo "missing $path" >&2; exit 1; }
+          done
+          [ "$(cat VERSION)" = "$(grep -o '\"0\.[0-9.]*\"' lisp/bridge-gate.asd | head -1 | tr -d '\"')" ] \
+            || { echo "VERSION and .asd :version disagree" >&2; exit 1; }
