@@ -230,17 +230,6 @@ XDG_DATA_DIRS="/usr/local/share:/usr/share" sbcl --no-userinit --non-interactive
 `make test` (via `scripts/test.sh`) runs exactly that, plus the `XDG_DATA_DIRS`
 sanitization described above.
 
-## AI disclosure
-
-This repository — including source code, tests, policies, and documentation —
-was designed and written with AI assistance. All behavior was verified by execution:
-the self-contained suite runs green with compiler warnings treated as errors,
-and every CLI command and exit code was exercised end-to-end in `--mock` mode. Live
-CyberArk/Tenable paths are contract-tested against mock HTTP fixtures (no live
-enterprise credentials were available); review the connector modules and your
-vendor's API docs before pointing them at production. Human review of generated
-code before production use is strongly recommended.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
